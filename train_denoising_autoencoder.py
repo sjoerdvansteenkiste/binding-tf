@@ -155,7 +155,9 @@ def get_raw_data(path, name, train_set):
 @ex.capture(prefix='training')
 def run_epoch(session, m, data, train_op, batch_size):
     """Runs the model on the given data."""
+    step = 0
     costs = 0.0
+    total_outputs = []
 
     # run through the epoch
     for step, x in enumerate(iterator(data, batch_size)):
@@ -166,8 +168,9 @@ def run_epoch(session, m, data, train_op, batch_size):
 
         # update stats
         costs += cost
+        total_outputs.append(outputs)
 
-    return costs/(step+1), outputs
+    return costs/(step+1), np.concatenate(total_outputs)
 
 
 def iterator(data, batch_size):
@@ -232,9 +235,18 @@ def delete_files(folder):
             print(e)
 
 
+def create_directory(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+
 @ex.automain
 def run(seed, save_path, network, optimization, training, _run):
     ex.commands['print_config']()
+
+    # create storage directories if they don't exist yet
+    create_directory('networks')
+    create_directory('temp_output')
 
     # clear temp folder
     delete_files('temp_output')
@@ -244,8 +256,8 @@ def run(seed, save_path, network, optimization, training, _run):
 
     # load data
     train_data, valid_data, test_data = get_raw_data()
-    save_img_ind = np.random.randint(test_data.shape[1])
-    save_image('temp_output/test_image.jpg', test_data[0, save_img_ind, :, :, 0])
+    save_img_ind = np.random.randint(valid_data.shape[1])
+    save_image('temp_output/valid_image.jpg', valid_data[0, save_img_ind, :, :, 0])
 
     # unpack some vars
     lr, lr_decay, lr_decay_after_epoch = optimization['lr'], optimization['lr_decay'], optimization['lr_decay_after_epoch']
@@ -265,10 +277,7 @@ def run(seed, save_path, network, optimization, training, _run):
         # init valid DAE models re-using the variables used at training time
         with tf.variable_scope("model", reuse=True, initializer=initializer):
             mvalid = DAEModel(is_training=False)
-
-            test_training = deepcopy(training)
-            test_training.update({'batch_size': test_data.shape[1]})
-            mtest = DAEModel(is_training=False, training=test_training)
+            mtest = DAEModel(is_training=False)
 
         # init all variables
         tf.initialize_all_variables().run()
@@ -291,10 +300,10 @@ def run(seed, save_path, network, optimization, training, _run):
             train_loss, _ = run_epoch(session, m, train_data, m.train_op)
             print("Epoch: %d Train Loss: %.3f" % (i + 1, train_loss))
 
-            valid_loss, _ = run_epoch(session, mvalid, valid_data, tf.no_op())
+            valid_loss, valid_outputs = run_epoch(session, mvalid, valid_data, tf.no_op())
             print("Epoch: %d Valid Loss: %.3f" % (i + 1, valid_loss))
 
-            test_loss, test_outputs = run_epoch(session, mtest, test_data, tf.no_op(), batch_size=test_training['batch_size'])
+            test_loss, _ = run_epoch(session, mtest, test_data, tf.no_op())
             print("Test Loss: %.3f" % test_loss)
 
             # update logs and save if old valid has improved
@@ -306,7 +315,8 @@ def run(seed, save_path, network, optimization, training, _run):
                 print("Saved to:", save_destination)
 
                 # save image of best epoch so far
-                save_image('temp_output/recon_test_image_e{}.jpg'.format(i), np.array(test_outputs)[save_img_ind, :].reshape(28, 28))
+                save_image('temp_output/recon_valid_image_e{}.jpg'.format(i),
+                           np.array(valid_outputs)[save_img_ind, :].reshape(28, 28))
 
                 patience = 0
             else:
