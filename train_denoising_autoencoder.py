@@ -10,7 +10,6 @@ import scipy.misc
 import tensorflow as tf
 import numpy as np
 
-from copy import deepcopy
 from sacred import Experiment
 
 from auto_encoder import AutoEncoder
@@ -99,7 +98,8 @@ def cfg():
     dataset = {
         'name': 'shapes',
         'path': './data',
-        'train_set': 'train_multi'  # {train_multi, train_single}
+        'train_set': 'train_multi',  # {train_multi, train_single}
+        'split': 0.9
     }
 
     noise = {
@@ -142,9 +142,9 @@ def open_dataset(path, name):
 
 
 @ex.capture(prefix='dataset')
-def get_raw_data(path, name, train_set):
+def get_raw_data(path, name, train_set, split):
     with open_dataset(path, name) as f:
-        train_size = int(0.9 * f[train_set]['default'].shape[1])
+        train_size = int(split * f[train_set]['default'].shape[1])
         train_data = f[train_set]['default'][:, :train_size]
         valid_data = f[train_set]['default'][:, train_size:]
         test_data = f['test']['default'][:]
@@ -241,7 +241,7 @@ def create_directory(directory):
 
 
 @ex.automain
-def run(seed, save_path, network, optimization, training, _run):
+def run(seed, save_path, network, optimization, training, dataset, _run):
     ex.commands['print_config']()
 
     # create storage directories if they don't exist yet
@@ -276,8 +276,8 @@ def run(seed, save_path, network, optimization, training, _run):
 
         # init valid DAE models re-using the variables used at training time
         with tf.variable_scope("model", reuse=True, initializer=initializer):
-            mvalid = DAEModel(is_training=False)
-            mtest = DAEModel(is_training=False)
+            valid_m = DAEModel(is_training=False)
+            test_m = DAEModel(is_training=False)
 
         # init all variables
         tf.initialize_all_variables().run()
@@ -300,10 +300,10 @@ def run(seed, save_path, network, optimization, training, _run):
             train_loss, _ = run_epoch(session, m, train_data, m.train_op)
             print("Epoch: %d Train Loss: %.3f" % (i + 1, train_loss))
 
-            valid_loss, valid_outputs = run_epoch(session, mvalid, valid_data, tf.no_op())
+            valid_loss, valid_outputs = run_epoch(session, valid_m, valid_data, tf.no_op())
             print("Epoch: %d Valid Loss: %.3f" % (i + 1, valid_loss))
 
-            test_loss, _ = run_epoch(session, mtest, test_data, tf.no_op())
+            test_loss, _ = run_epoch(session, test_m, test_data, tf.no_op())
             print("Test Loss: %.3f" % test_loss)
 
             # update logs and save if old valid has improved
@@ -311,7 +311,8 @@ def run(seed, save_path, network, optimization, training, _run):
             if valid_loss < best_val:
                 best_val = valid_loss
                 print("Best valid Loss improved to %.03f" % best_val)
-                save_destination = saver.save(session, os.path.join(save_path, str(seed) + "_best_model.ckpt"))
+                save_destination = saver.save(session, os.path.join(save_path, dataset['name'] + "_" + str(seed) +
+                                                                    "_best_model.ckpt"))
                 print("Saved to:", save_destination)
 
                 # save image of best epoch so far
@@ -328,9 +329,7 @@ def run(seed, save_path, network, optimization, training, _run):
             # update logs in sacred
             _run.info['epoch_nr'] = i + 1
             _run.info['nr_parameters'] = m.nvars.item()
-            _run.info['logs'] = {'train_loss': trains,
-                                 'valid_loss': vals,
-                                 'test_loss': tests}
+            _run.info['logs'] = {'train_loss': trains, 'valid_loss': vals, 'test_loss': tests}
 
         print("Training is over.")
         best_val_epoch = np.argmin(vals)

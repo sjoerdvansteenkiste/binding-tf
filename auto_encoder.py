@@ -7,27 +7,49 @@ import tensorflow as tf
 
 
 class AutoEncoder(object):
-    def __init__(self, size, input_size, hidden_activation=tf.sigmoid, output_activation=tf.sigmoid, tied=False):
-        self._size = size
-        self._input_size = input_size
+    def __init__(self, hidden_sizes, input_size, hidden_activation=tf.sigmoid, output_activation=tf.sigmoid,
+                 tied=False):
+
+        _hidden_sizes = hidden_sizes if isinstance(hidden_sizes, list) else [hidden_sizes]
+        self._sizes = [input_size]
+        self._sizes.extend(_hidden_sizes)
+
         self._tied = tied
         self._hidden_activation = hidden_activation
         self._output_activation = output_activation
 
-    def __call__(self, inputs, scope=''):
-        with tf.variable_scope(scope + 'Encode'):
-            W_enc = tf.get_variable('W', shape=[self._size, self._input_size], dtype=tf.float32)
-            bias_enc = tf.get_variable('bias', shape=[self._size], dtype=tf.float32)
+    def __call__(self, inputs):
 
-            code = self._hidden_activation(tf.matmul(inputs, W_enc, transpose_b=True) + bias_enc)
+        # encode
+        code = inputs
+        for i in range(len(self._sizes)-1):
+            with tf.variable_scope(str(i)):
+                code = self._encoding_layer(code, self._sizes[i], self._sizes[i+1])
 
-        with tf.variable_scope(scope + 'Decode'):
-            bias_dec = tf.get_variable('bias', shape=[self._input_size], dtype=tf.float32)
-
-            if self._tied:
-                outputs = self._output_activation(tf.matmul(code, W_enc) + bias_dec)
-            else:
-                W_dec = tf.get_variable('W', shape=[self._input_size, self._size], dtype=tf.float32)
-                outputs = self._output_activation(tf.matmul(code, W_dec, transpose_b=True) + bias_dec)
+        # decode
+        outputs = code
+        for i in reversed(range(len(self._sizes)-1)):
+            with tf.variable_scope(str(i)):
+                outputs = self._decoding_layer(outputs, self._sizes[i+1], self._sizes[i], self._tied)
 
         return outputs, {'code': code}
+
+    def _encoding_layer(self, inputs, input_size, size):
+        with tf.variable_scope('Encode'):
+            W = tf.get_variable('W', shape=[size, input_size], dtype=tf.float32)
+            bias = tf.get_variable('bias', shape=[size], dtype=tf.float32)
+
+        return self._hidden_activation(tf.matmul(inputs, W, transpose_b=True) + bias)
+
+    def _decoding_layer(self, inputs, input_size, size, tied):
+        with tf.variable_scope('Decode'):
+            bias = tf.get_variable('bias', shape=[size], dtype=tf.float32)
+
+        if tied:
+            with tf.variable_scope('Encode', reuse=True):
+                W = tf.transpose(tf.get_variable('W'))
+        else:
+            with tf.variable_scope('Decode'):
+                W = tf.get_variable('W', shape=[size, input_size], dtype=tf.float32)
+
+        return self._output_activation(tf.matmul(inputs, W, transpose_b=True) + bias)
