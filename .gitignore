@@ -51,4 +51,4 @@ fabric.properties
 .gitignore
 .idea/
 networks/
-temp_output/
+debug_output/
