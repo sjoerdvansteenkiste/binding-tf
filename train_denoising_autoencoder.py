@@ -134,8 +134,8 @@ def cfg():
         'nr_iters': 10,
         'k': 3,
         'nr_samples': 1000,
-        'e_step': 'expectation',  # expectation, expectation_pi, max, or max_pi
-        'init_type': 'gaussian',  # gaussian, uniform, or spatial
+        'e_step': 'expectation',  # {expectation, expectation_pi, max, or max_pi}
+        'init_type': 'gaussian',  # {gaussian, uniform, or spatial}
         'dump_results': None
     }
 
@@ -397,7 +397,7 @@ def reconstruction_clustering(session, model, input_data, true_groups, k, nr_ite
 
         # run the k copies of the autoencoder
         for _k in range(k):
-            loss, outputs = run_epoch(session, model, X[..., _k], tf.no_op(), targets=input_data[..., 0])
+            loss, outputs = run_epoch(session, model, X[..., _k], tf.no_op(), targets=input_data[..., 0], batch_size=1)
             Y[..., _k] = outputs.reshape((1, 1, H, W, C))
 
         # save the log-likelihood after the M-step
@@ -442,7 +442,7 @@ def evaluate(session, model, nr_samples, test_data, test_groups, dump_results=No
 
 
 @ex.automain
-def run(seed, save_path, dataset, debug, _run):
+def run(seed, save_path, dataset, training, debug, _run):
     ex.commands['print_config']()
 
     # create storage directories if they don't exist yet
@@ -473,22 +473,17 @@ def run(seed, save_path, dataset, debug, _run):
     # load test data
     test_data, test_groups = get_test_data()
 
+    # create new session
     with tf.Graph().as_default(), tf.Session() as session:
         with tf.variable_scope("model"):
-            m = DAEModel(is_training=True)
+            batch_size = 1
+            b_training = training.copy()
+            b_training['batch_size'] = batch_size
+            m = DAEModel(is_training=True, training=b_training)
+
+        # restore params
         saver = tf.train.Saver()
         saver.restore(session, net_filename)
 
-        valid_loss, valid_outputs = run_epoch(session, m, data['valid_data'], tf.no_op())
-        utils.save_image('debug_output/recon_valid_image_post_training.jpg', np.array(valid_outputs)[save_img_ind, :].reshape(28, 28))
-
-        valid_loss, valid_outputs = run_epoch(session, m, data['valid_data'], tf.no_op())
-        utils.save_image('debug_output/recon_valid_image_post_training1.jpg',
-                             np.array(valid_outputs)[save_img_ind, :].reshape(28, 28))
-
-
-
         # run reconstruction clustering for dea
-        evaluate(session=session, model=m, test_data=test_data, test_groups=test_groups)
-
-    return 0
+        return evaluate(session=session, model=m, test_data=test_data, test_groups=test_groups)
