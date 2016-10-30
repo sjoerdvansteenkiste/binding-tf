@@ -19,7 +19,7 @@ ex = Experiment("binding_dae")
 
 class DAEModel(object):
     @ex.capture
-    def __init__(self, is_training, network, training, optimization):
+    def __init__(self, is_training, network, training):
         self._is_training = is_training
 
         self._input_data = tf.placeholder(tf.float32, [training['batch_size'], network['input_size']])
@@ -49,15 +49,8 @@ class DAEModel(object):
         tvars = tf.trainable_variables()
         self._nvars = utils.get_variable_total(tvars, verbose=True)
 
-        opt = None
-        if optimization['name'] == 'adam':
-            opt = tf.train.AdamOptimizer()
-        elif optimization['name'] == 'sgd':
-            opt = tf.train.GradientDescentOptimizer(self.lr)
-        elif optimization['name'] == 'adagrad':
-            opt = tf.train.AdagradOptimizer(self.lr)
-        elif optimization['name'] == 'sgd-mom':
-            opt = tf.train.MomentumOptimizer(self.lr, 0.9, use_nesterov=True)
+        # create optimizer
+        opt = tf.train.GradientDescentOptimizer(self.lr)
 
         self._train_op = opt.minimize(loss)
 
@@ -98,7 +91,7 @@ def cfg():
     dataset = {
         'name': 'shapes',
         'path': './data',
-        'train_set': 'train_multi',  # {train_multi, train_single}
+        'train_set': 'train_single',  # {train_multi, train_single}
         'split': 0.9
     }
 
@@ -110,8 +103,7 @@ def cfg():
     }
 
     optimization = {
-        'name': 'sgd',
-        'lr': 0.05,
+        'lr': 0.01,
         'lr_decay': 1.0,
         'lr_decay_after_epoch': 500
     }
@@ -141,7 +133,7 @@ def cfg():
 
     save_path = './networks'
     verbose = True
-    debug = True
+    debug = False
 
 
 @ex.capture(prefix='dataset')
@@ -177,8 +169,9 @@ def run_epoch(session, m, data, train_op, batch_size, targets=None):
     costs = 0.0
     total_outputs = []
 
-    # noisify targets if not provided
-    targets = targets if targets is not None else noisify(data=data)
+    # data equals targets if not provided - input becomes noisy
+    targets = targets if targets is not None else data
+    data = data if targets is not None else noisify(data=data)
 
     # run through the epoch
     for step, (x, y) in enumerate(iterator(data, targets, batch_size)):
