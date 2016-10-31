@@ -1,5 +1,0 @@
-numpy
-tensorflow
-sacred
-h5py
-sklearn

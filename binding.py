@@ -128,7 +128,7 @@ def cfg():
         'nr_samples': 1000,
         'e_step': 'expectation',  # {expectation, expectation_pi, max, or max_pi}
         'init_type': 'gaussian',  # {gaussian, uniform, or spatial}
-        'dump_results': None
+        'save_file': None
     }
 
     save_path = './networks'
@@ -407,7 +407,7 @@ def reconstruction_clustering(session, model, input_data, true_groups, k, nr_ite
 
 
 @ex.command(prefix='em')
-def evaluate(session, model, nr_samples, test_data, test_groups, dump_results=None):
+def evaluate(session, model, nr_samples, test_data, test_groups, save_file=None):
 
     all_scores = []
     all_likelihoods = []
@@ -426,16 +426,16 @@ def evaluate(session, model, nr_samples, test_data, test_groups, dump_results=No
     print('Average Score: {:.4f}'.format(all_scores[:, -1, 0].mean()))
     print('Average Confidence: {:.4f}'.format(all_scores[:, -1, 1].mean()))
 
-    if dump_results is not None:
+    if save_file is not None:
         import pickle
-        with open(dump_results, 'wb') as f:
+        with open(save_file, 'wb') as f:
             pickle.dump((all_scores, all_likelihoods, all_gammas), f)
-        print('wrote the results to {}'.format(dump_results))
+        print('wrote the results to {}'.format(save_file))
     return all_scores[:, -1, 0].mean()
 
 
 @ex.automain
-def run(seed, save_path, dataset, training, debug, _run):
+def run(seed, save_path, dataset, training, debug):
     ex.commands['print_config']()
 
     # create storage directories if they don't exist yet
