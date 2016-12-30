@@ -5,11 +5,15 @@ from __future__ import (print_function, division, absolute_import, unicode_liter
 
 import os
 import numpy as np
+import tensorflow as tf
 
 
 def save_image(filename, image_array):
     import scipy.misc
-    scipy.misc.imsave(filename, image_array)
+    if image_array.shape[2] == 1:
+        scipy.misc.toimage(image_array[:, :, 0], cmin=0.0, cmax=1.0).save(filename)
+    else:
+        scipy.misc.toimage(255*image_array).save(filename)
 
 
 def delete_files(folder):
@@ -40,3 +44,15 @@ def get_variable_total(_vars, verbose=True):
         print(total_n_vars, 'total variables')
 
     return total_n_vars
+
+
+ACTIVATION_FUNCTIONS = {
+    'sigmoid': tf.nn.sigmoid,
+    'tanh': tf.nn.tanh,
+    'relu': tf.nn.relu,
+    'elu': tf.nn.elu
+}
+
+
+def parse_activation_function(name_list):
+    return [ACTIVATION_FUNCTIONS[name] for name in name_list]

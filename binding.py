@@ -6,84 +6,93 @@ from __future__ import (print_function, division, absolute_import, unicode_liter
 import os
 import h5py
 import utils
+import time
+import pickle
 
 import tensorflow as tf
 import numpy as np
+import reconstruction_clustering as rc
 
 from sacred import Experiment
 from auto_encoder import AutoEncoder
-from sklearn.metrics import adjusted_mutual_info_score
-
-ex = Experiment("binding_dae")
+from reconstruction_clustering import ReconstructionClustering
 
 
-class DAEModel(object):
+ex = Experiment("binding")
+
+
+class BindingModel(object):
     @ex.capture
-    def __init__(self, is_training, network, training):
+    def __init__(self, is_training, network, em, dataset):
+        _shape = dataset['shape']
+
+        # AE vars
+        _input_size = _shape[0] * _shape[1] * _shape[2]
         self._is_training = is_training
+        self.ae_input_data = tf.placeholder(tf.float32, [None, _input_size])
+        self.targets = tf.placeholder(tf.float32, [None, _input_size])
 
-        self._input_data = tf.placeholder(tf.float32, [training['batch_size'], network['input_size']])
-        self._targets = tf.placeholder(tf.float32, [training['batch_size'], network['input_size']])
+        # model
+        self._ae = AutoEncoder(network['hidden_size'], _input_size, network['e_activation'],
+                               network['d_activation'], tied=network['tied'])
 
-        if network['hidden_activation'] == 'tanh':
-            ae = AutoEncoder(network['hidden_size'], network['input_size'],
-                             hidden_activation=tf.tanh, tied=network['tied'])
-        elif network['hidden_activation'] == 'relu':
-            ae = AutoEncoder(network['hidden_size'], network['input_size'],
-                             hidden_activation=tf.nn.relu, tied=network['tied'])
+        self.outputs, self.cost, self.lr, self.n_vars, self.train_op = 5*[None]
+        self.build_network_training_model(dataset['binary'])
+
+        # RC vars
+        self.rc_input_data = tf.placeholder(tf.float32, [1, None] + _shape + [1])
+        self.pi = tf.placeholder(tf.float32, [1, None, 1, 1, 1, em['k']])
+        self.gamma = tf.placeholder(tf.float32, [1, None] + _shape[:2] + [1, em['k']])
+
+        # RC model
+        _distribution = 'binomial' if dataset['binary'] else 'gaussian'
+        self._rc = ReconstructionClustering(self._ae, _shape, em['k'], em['e_step'], _distribution, dataset['binary'])
+
+        self.new_gamma, self.new_pi, self.likelihood_post_m, self.likelihood_post_e = 4*[None]
+        self.build_reconstruction_clustering_model()
+
+    def build_network_training_model(self, binary):
+        self.outputs, state_dict = self._ae(self.ae_input_data)
+
+        if binary:
+            pixel_loss = tf.reduce_sum(self.binomial_cross_entropy_loss(self.outputs, self.targets), 1)
         else:
-            ae = AutoEncoder(network['hidden_size'], network['input_size'], tied=network['tied'])
+            pixel_loss = tf.reduce_sum(self.squared_error_loss(self.outputs, self.targets), 1)
 
-        self._outputs, state_dict = ae(self._input_data)
+        loss = tf.reduce_mean(pixel_loss)
+        self.cost = loss
 
-        pixel_ce = binomial_cross_entropy_loss(self._outputs, self._targets)
-        loss = tf.reduce_mean(tf.reduce_sum(pixel_ce, reduction_indices=1))
-        self._cost = loss
-
-        if not is_training:
+        if not self._is_training:
             return
 
-        self._lr = tf.Variable(0.0, trainable=False)
+        self.lr = tf.Variable(0.0, trainable=False)
 
         # print total number of trainable variables
         tvars = tf.trainable_variables()
-        self._nvars = utils.get_variable_total(tvars, verbose=True)
+        self.n_vars = utils.get_variable_total(tvars, verbose=True)
 
         # create optimizer
         opt = tf.train.GradientDescentOptimizer(self.lr)
 
-        self._train_op = opt.minimize(loss)
+        self.train_op = opt.minimize(loss)
+
+    def build_reconstruction_clustering_model(self, ):
+        self.new_gamma, self.new_pi, self.likelihood_post_m, self.likelihood_post_e = \
+            self._rc(self.rc_input_data, self.gamma, self.pi)
 
     def assign_lr(self, session, lr_value):
         session.run(tf.assign(self.lr, lr_value))
 
-    @property
-    def input_data(self):
-        return self._input_data
+    @staticmethod
+    def binomial_cross_entropy_loss(y, t):
+        bce = t * tf.log(tf.clip_by_value(y, 1e-6, 1.)) + (1. - t) * tf.log(tf.clip_by_value(1 - y, 1e-6, 1.))
 
-    @property
-    def targets(self):
-        return self._targets
+        return -bce
 
-    @property
-    def cost(self):
-        return self._cost
-
-    @property
-    def outputs(self):
-        return self._outputs
-
-    @property
-    def lr(self):
-        return self._lr
-
-    @property
-    def train_op(self):
-        return self._train_op
-
-    @property
-    def nvars(self):
-        return self._nvars
+    @staticmethod
+    def squared_error_loss(y, t):
+        se = (y - t)**2
+        return se
 
 
 @ex.config
@@ -92,20 +101,23 @@ def cfg():
         'name': 'shapes',
         'path': './data',
         'train_set': 'train_single',  # {train_multi, train_single}
-        'split': 0.9
+        'split': 0.9,
+        'shape': (28, 28, 1),
+        'binary': True
     }
 
     noise = {
         'name': 'salt_n_pepper',
+        'probability': 0.5,
+        'dynamic': False,               # if dynamic set to true it will ignore the params
         'param': {'ratio': 0.5,
-                  'probability': 0.5
         }
     }
 
     optimization = {
-        'lr': 0.01,
-        'lr_decay': 1.0,
-        'lr_decay_after_epoch': 500
+        'lr': 0.1,
+        'lr_decay': 0.98,
+        'lr_decay_after_epoch': 10
     }
 
     training = {
@@ -115,20 +127,21 @@ def cfg():
     }
 
     network = {
-        'input_size': 28*28,
-        'hidden_size': 250,
+        'name': 'AE',
+        'hidden_size': [500],              # hidden sizes of the encoder - decoder.
         'init_scale': 0.1,
-        'hidden_activation': 'tanh',
-        'tied': False
+        'e_activation': ['tanh'],               # encoder activations
+        'd_activation': ['sigmoid'],            # decoder activations
+        'tied': False,
     }
 
     em = {
         'nr_iters': 10,
         'k': 3,
-        'nr_samples': 1000,
+        'nr_samples': np.inf,
         'e_step': 'expectation',  # {expectation, expectation_pi, max, or max_pi}
         'init_type': 'gaussian',  # {gaussian, uniform, or spatial}
-        'save_file': None
+        'suffix': None            # specify the suffix, None is default, use None to not save
     }
 
     save_path = './networks'
@@ -145,37 +158,43 @@ def open_dataset(path, name):
 
 @ex.capture(prefix='dataset')
 def get_training_data(path, name, train_set, split):
+    data = {}
     with open_dataset(path, name) as f:
-        train_size = int(split * f[train_set]['default'].shape[1])
-        train_data = f[train_set]['default'][:, :train_size]
-        valid_data = f[train_set]['default'][:, train_size:]
+        if name in ['bars', 'corners', 'easy_superpos', 'mnist_shapes', 'multi_mnist_thresholded', 'shapes']:
+            train_size = int(split * f[train_set]['default'].shape[1])
+            data['train_data'] = f[train_set]['default'][:, :train_size]
+            data['train_groups'] = f[train_set]['groups'][:, :train_size]
+            data['valid_data'] = f[train_set]['default'][:, train_size:]
+            data['valid_groups'] = f[train_set]['groups'][:, train_size:]
+        else:
+            raise ValueError('Unknown dataset "{}"'.format(name))
 
-    return train_data, valid_data
+    return data
 
 
 @ex.capture(prefix='dataset')
 def get_test_data(path, name):
+    data = {}
     with open_dataset(path, name) as f:
-        test_data = f['test']['default'][:]
-        test_groups = f['test']['groups'][:]
+        if name in ['bars', 'corners', 'easy_superpos', 'mnist_shapes', 'multi_mnist_thresholded', 'shapes']:
+            data['test_data'] = f['test']['default'][:]
+            data['test_groups'] = f['test']['groups'][:]
+        else:
+            raise ValueError('Unknown dataset "{}"'.format(name))
 
-    return test_data, test_groups
+    return data
 
 
-@ex.capture(prefix='training')
-def run_epoch(session, m, data, train_op, batch_size, targets=None):
-    """Runs the model on the given data."""
+@ex.capture()
+def run_epoch(session, m, data, targets, train_op, training, network):
+    """Runs the training part on the given data."""
     step = 0
     costs = 0.0
     total_outputs = []
 
-    # data equals targets if not provided - input becomes noisy
-    targets = targets if targets is not None else data
-    data = data if targets is not None else noisify(data=data)
-
     # run through the epoch
-    for step, (x, y) in enumerate(iterator(data, targets, batch_size)):
-        feed_dict = {m.input_data: x, m.targets: y}
+    for step, (x, y) in enumerate(iterator(data, targets, training['batch_size'], network['name'] == 'CAE')):
+        feed_dict = {m.ae_input_data: x, m.targets: y}
 
         # run batch
         cost, outputs, _ = session.run([m.cost, m.outputs, train_op], feed_dict)
@@ -187,27 +206,70 @@ def run_epoch(session, m, data, train_op, batch_size, targets=None):
     return costs/(step+1), np.concatenate(total_outputs)
 
 
-def iterator(data, targets, batch_size):
-    """
-    Iterates through the data
-    :param data: inputs (assumes data to be in format (T, B, ROW, COLUMN, CH))
-    :param targets: optional targets
-    :param batch_size: batch_size
-    :return: yield batch at each call
-    """
-    epoch_size = data.shape[1] // batch_size
+def _run_rc_iteration(session, m, input_data, gamma, pi):
+    feed_dict = {m.rc_input_data: input_data, m.gamma: gamma, m.pi: pi}
+
+    return session.run([m.new_gamma, m.new_pi, m.likelihood_post_m, m.likelihood_post_e], feed_dict)
+
+
+@ex.capture(prefix='em')
+def _run_reconstruction_clustering(session, m, input_data, true_groups, k,
+                                   nr_iters, init_type, binary, e_step, rnd):
+        # init distribution
+        distribution = 'binomial' if binary else 'gaussian'
+
+        # obtain input dimensions and add cluster dimension
+        T, N, H, W, C = input_data.shape
+        input_data = input_data[..., None]  # add a cluster dimension
+        true_groups = true_groups.reshape(N, -1) if true_groups is not None else None  # reshape for computing scores
+
+        # allocate storage space
+        gammas = np.zeros((nr_iters + 1, T, N, H, W, 1, k))
+        likelihoods = np.zeros((2 * nr_iters + 1, N))
+        scores = -1 * np.ones((nr_iters + 1, N, 2))
+
+        # init pi and output_prior
+        pi = np.ones((1, N, 1, 1, 1, k)) / k
+        output_prior = np.ones_like(input_data) * 0.5
+
+        # set initial values
+        gammas[0] = rc.get_initial_groups(k=k, dims=(N, H, W), init_type=init_type, rnd=rnd, hard_assign=e_step.startswith('max'))
+        likelihoods[0] = rc.get_likelihood(output_prior, input_data, gammas[0], distribution)
+
+        if true_groups is not None:
+            scores[0, :, 0], scores[0, :, 1] = rc.evaluate_groups(true_groups, gammas[0].reshape(N, -1, k))
+
+        # run rc for specified number of iterations
+        for j in range(nr_iters):
+            gammas[j + 1], pi, likelihoods[2 * j + 1],  likelihoods[2 * j + 2] = _run_rc_iteration(
+                session, m, input_data, gammas[j], pi)
+
+            # save the score and confidence
+            if true_groups is not None:
+                scores[j + 1, :, 0], scores[j + 1, :, 1] = rc.evaluate_groups(true_groups, gammas[j + 1].reshape(N, -1, k))
+
+        return gammas, likelihoods, scores
+
+
+def iterator(data, targets, batch_size, use_convolution):
+    epoch_size = data.shape[1] // batch_size  # TODO enable for the remainder
 
     for i in range(epoch_size):
-        yield (data[0, i*batch_size: (i+1)*batch_size, :, :].reshape(batch_size, -1),
-               targets[0, i*batch_size: (i+1)*batch_size, :, :].reshape(batch_size, -1))
+        if use_convolution:
+            yield (data[0, i * batch_size: (i + 1) * batch_size], targets[0, i * batch_size: (i + 1) * batch_size])
+        else:
+            yield (data[0, i*batch_size: (i+1)*batch_size].reshape(batch_size, -1),
+                   targets[0, i*batch_size: (i+1)*batch_size].reshape(batch_size, -1))
 
-    # yield data[0, epoch_size*batch_size:, :, :].reshape(batch_size, -1)
+    # yield (data[0, epoch_size*batch_size:, :, :].reshape(batch_size, -1),
+    #        targets[0, epoch_size*batch_size:, :, :].reshape(batch_size, -1))
 
 
 @ex.capture
-def train_dae(seed, network, optimization, training, data, net_filename, debug, _run, **kwargs):
+def train_dae(seed, network, optimization, training, dataset, data, net_folder_path, debug, _run, **kwargs):
     # unpack some vars
-    lr, lr_decay, lr_dea = optimization['lr'], optimization['lr_decay'], optimization['lr_decay_after_epoch']
+    lr, base_lr_decay, lr_dea = optimization['lr'], optimization['lr_decay'], optimization['lr_decay_after_epoch']
+    net_file_path = os.path.join(net_folder_path, "best_model.ckpt")
 
     with tf.Graph().as_default(), tf.Session() as session:
 
@@ -219,16 +281,16 @@ def train_dae(seed, network, optimization, training, data, net_filename, debug, 
 
         # init train DAE model
         with tf.variable_scope("model", reuse=None, initializer=initializer):
-            m = DAEModel(is_training=True)
+            m = BindingModel(is_training=True)
 
         # init valid DAE models re-using the variables used at training time
-        with tf.variable_scope("model", reuse=True, initializer=initializer):
-            valid_m = DAEModel(is_training=False)
+        with tf.variable_scope("model", reuse=True, initializer=initializer):        # TODO currently redundant
+            valid_m = BindingModel(is_training=False)
 
         # init all variables
-        tf.initialize_all_variables().run()
+        tf.global_variables_initializer().run()
         saver = tf.train.Saver()
-        trains, vals, best_val = [np.inf], [np.inf], np.inf
+        train_losses, valid_losses, train_scores, valid_scores, best_val = [np.inf], [np.inf], [-np.inf], [-np.inf], np.inf
 
         # start training
         patience = 0
@@ -238,208 +300,158 @@ def train_dae(seed, network, optimization, training, data, net_filename, debug, 
                 break
 
             # compute decay -> learning rate and assign in model
-            lr_decay = lr_decay ** max(i - lr_dea, 0.0)
+            lr_decay = base_lr_decay ** max(i - lr_dea, 0.0)
             m.assign_lr(session, lr * lr_decay)
             print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
 
-            # evaluate models
-            train_loss, _ = run_epoch(session, m, data['train_data'], m.train_op)
-            print("Epoch: %d Train Loss: %.3f" % (i + 1, train_loss))
+            # produce data
+            t = time.time()
+            train_data, train_targets = noisify(data=data['train_data']), data['train_data']
 
-            valid_loss, valid_outputs = run_epoch(session, valid_m, data['valid_data'], tf.no_op())
-            print("Epoch: %d Valid Loss: %.3f" % (i + 1, valid_loss))
+            # evaluate and update training model
+            train_loss, _ = run_epoch(session, m, train_data, train_targets, m.train_op)
+            print("Epoch: %d Train Loss: %.3f, took %.3fs" % (i + 1, train_loss, time.time()-t))
 
-            # update logs and save if old valid has improved
-            trains.append(train_loss)
+            # produce data
+            t = time.time()
+            valid_data, valid_targets = noisify(data=data['valid_data']), data['valid_data']
+
+            # evaluate valid model
+            valid_loss, valid_outputs = run_epoch(session, valid_m, valid_data, valid_targets, tf.no_op())
+            print("Epoch: %d Valid Loss: %.3f, took %.3fs" % (i + 1, valid_loss, time.time()-t))
+
+            # save if old valid has improved
             if valid_loss < best_val:
                 best_val = valid_loss
                 print("Best valid Loss improved to %.03f" % best_val)
-                save_destination = saver.save(session, net_filename)
+                save_destination = saver.save(session, net_file_path)
                 print("Saved to:", save_destination)
 
                 # save image of best epoch so far
                 if debug:
-                    utils.save_image('debug_output/recon_valid_image_e{}.jpg'.format(i),
-                                     np.array(valid_outputs)[kwargs['save_img_ind'], :].reshape(28, 28))
+                    input_valid_image = valid_data[0, kwargs['save_img_ind']]
+                    utils.save_image('debug_output/input_valid_image_e{}.jpg'.format(i), input_valid_image)
+
+                    output_valid_image = valid_outputs[kwargs['save_img_ind']].reshape(dataset['shape'])
+                    utils.save_image('debug_output/recon_valid_image_e{}.jpg'.format(i), output_valid_image)
 
                 patience = 0
             else:
                 patience += 1
 
-            vals.append(valid_loss)
+            # update logs of losses and scores
+            train_losses.append(train_loss)
+            valid_losses.append(valid_loss)
 
             # update logs in sacred
             _run.info['epoch_nr'] = i + 1
-            _run.info['nr_parameters'] = m.nvars.item()
-            _run.info['logs'] = {'train_loss': trains, 'valid_loss': vals}
+            _run.info['nr_parameters'] = m.n_vars.item()
+            _run.info['logs'] = {'train_loss': train_losses, 'valid_loss': valid_losses}
 
         # add network to db
-        ex.add_artifact(net_filename)
+        ex.add_artifact(net_file_path)
 
         # log results
         print("Training is over.")
-        best_val_epoch = np.argmin(vals)
-        print("Best validation loss %.03f was at Epoch %d" % (vals[best_val_epoch], best_val_epoch))
-        print("Training loss at this Epoch was %.03f" % trains[best_val_epoch])
+        best_val_epoch = np.argmin(valid_losses)
+        print("Best validation loss %.03f was at Epoch %d" % (valid_losses[best_val_epoch], best_val_epoch))
+        print("Training loss at this Epoch was %.03f" % train_losses[best_val_epoch])
         _run.info['best_val_epoch'] = best_val_epoch
-        _run.info['best_valid_loss'] = vals[best_val_epoch]
+        _run.info['best_valid_loss'] = valid_losses[best_val_epoch]
 
 
 @ex.capture(prefix='noise')
-def noisify(name, param, data):
-    noisy_data = data.copy()
+def noisify(name, probability, dynamic, param, data):
     if name == 'salt_n_pepper':
-        r = np.random.rand(*noisy_data.shape)
-        noisy_data[r >= 1.0 - param['probability'] * param['ratio']] = 1.0  # salt
-        noisy_data[r <= param['probability'] * (1.0 - param['ratio'])] = 0.0  # pepper
+        ratio = np.sum(data) / np.prod(data.shape) if dynamic else param['ratio']
+        noisy_data = salt_and_pepper_noise(data, probability, ratio)
+    elif name == 'gaussian':
+        mu, sigma = (np.mean(data), np.std(data)) if dynamic else (param['mu'], param['sigma'])
+        noisy_data = gaussian_noise(data, probability, mu, sigma)
+    else:
+        raise ValueError('Unknown noise "{}"'.format(name))
 
     return noisy_data
 
 
-def binomial_cross_entropy_loss(y, t):
-    # - t * ln(y) - (1-t) * ln(1-y)
-    bce = t * tf.log(tf.clip_by_value(y, 1e-6, 1.)) + (1. - t) * tf.log(tf.clip_by_value(1-y, 1e-6, 1.))
+def salt_and_pepper_noise(data, probability, ratio):
+    noisy_data = data.copy()
 
-    return -bce
+    r = np.random.rand(*noisy_data.shape)
+    noisy_data[r >= 1.0 - probability * ratio] = 1.0  # salt
+    noisy_data[r <= probability * (1.0 - ratio)] = 0.0  # pepper
 
-
-def load_session(net_filename):
-    with tf.Session() as session:
-        saver = tf.train.Saver()
-        saver.restore(session, net_filename)
-
-    return session
+    return noisy_data
 
 
-def get_likelihood(Y, T, group_channels):
-    log_loss = T * np.log(Y.clip(1e-6, 1 - 1e-6)) + (1 - T) * np.log((1 - Y).clip(1e-6, 1 - 1e-6))
+def gaussian_noise(data, probability, mu, sigma):
+    noisy_data = data.copy()
 
-    return np.sum(log_loss * group_channels)
+    r = np.random.rand(*noisy_data.shape)
+    n = sigma * np.random.randn(*noisy_data.shape) + mu
+    idx = r >= 1.0 - probability
+    noisy_data[idx] = n[idx]
 
-
-@ex.capture(prefix='em')
-def get_initial_groups(k, dims, init_type, _rnd, low=.25, high=.75):
-    shape = (1, 1, dims[0], dims[1], 1, k)  # (T, B, H, W, C, K)
-    if init_type == 'spatial':
-        assert k == 3
-        group_channels = np.zeros((dims[0], dims[1], 3))
-        group_channels[:, :, 0] = np.linspace(0, 0.5, dims[0])[:, None]
-        group_channels[:, :, 1] = np.linspace(0, 0.5, dims[1])[None, :]
-        group_channels[:, :, 2] = 1.0 - group_channels.sum(2)
-        group_channels = group_channels.reshape(shape)
-    elif init_type == 'gaussian':
-        group_channels = np.abs(_rnd.randn(*shape))
-        group_channels /= group_channels.sum(5)[..., None]
-    elif init_type == 'uniform':
-        group_channels = _rnd.uniform(low, high, size=shape)
-        group_channels /= group_channels.sum(5)[..., None]
-    else:
-        raise ValueError('Unknown init_type "{}"'.format(init_type))
-    return group_channels
+    return noisy_data
 
 
-def evaluate_groups(true_groups, predicted):
-    idxs = np.where(true_groups != 0.0)
-    score = adjusted_mutual_info_score(true_groups[idxs],
-                                       predicted.argmax(1)[idxs])
-    confidence = np.mean(predicted.max(1)[idxs])
-    return score, confidence
+@ex.capture
+def perform_reconstruction_clustering(session, m, em, data, groups, binary, rnd, em_dump_path=None):
+    nr_samples = min(em['nr_samples'], data.shape[1])
+    sliced_data = data[:, :nr_samples]
+    sliced_groups = groups[:, :nr_samples] if groups is not None else None
 
+    all_gammas, all_likelihoods, all_scores = _run_reconstruction_clustering(
+        session, m, sliced_data, sliced_groups, binary=binary, rnd=rnd)
 
-@ex.capture(prefix='em')
-def perform_e_step(T, Y, mixing_factors, e_step, k):
-    loss = (T * Y + (1 - T) * (1 - Y)) * mixing_factors
-    if e_step == 'expectation':
-        group_channels = loss / loss.sum(5)[..., None]
-    elif e_step == 'expectation_pi':
-        group_channels = loss / loss.sum(5)[..., None]
-        mixing_factors = group_channels.reshape(-1, k).sum(0)
-        mixing_factors /= mixing_factors.sum()
-    elif e_step == 'max':
-        group_channels = (loss == loss.max(5)[..., None]).astype(np.float)
-    elif e_step == 'max_pi':
-        group_channels = (loss == loss.max(5)[..., None]).astype(np.float)
-        mixing_factors = group_channels.reshape(-1, k).sum(0)
-        mixing_factors /= mixing_factors.sum()
-    else:
-        raise ValueError('Unknown e_type: "{}"'.format(e_step))
-
-    return group_channels, mixing_factors
-
-
-@ex.command(prefix='em')
-def reconstruction_clustering(session, model, input_data, true_groups, k, nr_iters):
-    T, N, H, W, C = input_data.shape
-    input_data = input_data[..., None]  # add a cluster dimension
-
-    mixing_factors = np.ones((1, 1, 1, 1, k)) / k
-    gamma = get_initial_groups(dims=(H, W))
-    output_prior = np.ones_like(input_data) * 0.5
-
-    gammas = np.zeros((nr_iters + 1, 1, H, W, C, k))
-    likelihoods = np.zeros(2 * nr_iters + 1)
-    scores = np.zeros((nr_iters + 1, 2))
-
-    gammas[0:1] = gamma
-    likelihoods[0] = get_likelihood(output_prior, input_data, gamma)
-    scores[0] = evaluate_groups(true_groups.flatten(), gamma.reshape(-1, k))
-
-    for j in range(nr_iters):
-        X = gamma * input_data
-        Y = np.zeros_like(X)
-
-        # run the k copies of the autoencoder
-        for _k in range(k):
-            loss, outputs = run_epoch(session, model, X[..., _k], tf.no_op(), targets=input_data[..., 0], batch_size=1)
-            Y[..., _k] = outputs.reshape((1, 1, H, W, C))
-
-        # save the log-likelihood after the M-step
-        likelihoods[2*j+1] = get_likelihood(Y, input_data, gamma)
-        # perform an E-step
-        gamma, mixing_factors = perform_e_step(input_data, Y, mixing_factors)
-        # save the log-likelihood after the E-step
-        likelihoods[2*j+2] = get_likelihood(Y, input_data, gamma)
-        # save the resulting group-assignments
-        gammas[j+1] = gamma[0]
-        # save the score and confidence
-        scores[j+1] = evaluate_groups(true_groups.flatten(), gamma.reshape(-1, k))
-    return gammas, likelihoods, scores
-
-
-@ex.command(prefix='em')
-def evaluate(session, model, nr_samples, test_data, test_groups, save_file=None):
-
-    all_scores = []
-    all_likelihoods = []
-    all_gammas = []
-    nr_samples = min(nr_samples, test_data.shape[1])
-    for i in range(nr_samples):
-        gammas, likelihoods, scores = reconstruction_clustering(session, model, test_data[:, i:i+1], test_groups[:, i:i+1])
-        all_gammas.append(gammas)
-        all_likelihoods.append(likelihoods)
-        all_scores.append(scores)
-
-    all_gammas = np.array(all_gammas)
-    all_likelihoods = np.array(all_likelihoods)
-    all_scores = np.array(all_scores)
+    all_gammas = np.swapaxes(all_gammas, 1, 2)
+    all_gammas = np.swapaxes(all_gammas, 0, 1)
+    all_likelihoods = np.swapaxes(all_likelihoods, 0, 1)
+    all_scores = np.swapaxes(all_scores, 0, 1)
 
     print('Average Score: {:.4f}'.format(all_scores[:, -1, 0].mean()))
     print('Average Confidence: {:.4f}'.format(all_scores[:, -1, 1].mean()))
 
-    if save_file is not None:
-        import pickle
-        with open(save_file, 'wb') as f:
+    if em_dump_path is not None:
+        with open(em_dump_path, 'wb') as f:
             pickle.dump((all_scores, all_likelihoods, all_gammas), f)
-        print('wrote the results to {}'.format(save_file))
+        print('wrote the results to {}'.format(em_dump_path))
     return all_scores[:, -1, 0].mean()
 
 
+def perform_reconstruction_clustering_from_file(net_folder_path, data, groups, rnd, em=None, em_dump_path=None):
+    """ Support external usage, i.e. loading a trained network and rebinding it elsewhere"""
+    net_filename_path = os.path.join(net_folder_path, "best_model.ckpt")
+    model_config_path = os.path.join(net_folder_path, "model_config.pickle")
+
+    # load config
+    with open(model_config_path, 'rb') as f:
+        model_config = pickle.load(f)
+
+    network, dataset = model_config['network'], model_config['dataset']
+    em = em if em is not None else model_config['em']
+
+    # create new session
+    with tf.Graph().as_default(), tf.Session() as session:
+        with tf.variable_scope("model"):
+            m = BindingModel(False, network, em, dataset)
+
+        # restore params
+        saver = tf.train.Saver()
+        saver.restore(session, net_filename_path)
+
+        # run reconstruction clustering for dea
+        return perform_reconstruction_clustering(session=session, m=m, em=em, data=data, groups=groups,
+                                                 binary=dataset['binary'], rnd=rnd, em_dump_path=em_dump_path)
+
+
 @ex.automain
-def run(seed, save_path, dataset, training, debug):
+def run(seed, save_path, network, em, dataset, _rnd, debug):
     ex.commands['print_config']()
 
     # create storage directories if they don't exist yet
     utils.create_directory('networks')
+    utils.create_directory('results')
 
     if debug:
         utils.create_directory('debug_output')
@@ -449,34 +461,36 @@ def run(seed, save_path, dataset, training, debug):
     np.random.seed(seed)
 
     # load data
-    train_data, valid_data = get_training_data()
+    data = get_training_data()
 
     # if debug set to true the trainer will report on the dae performance
-    save_img_ind = np.random.randint(valid_data.shape[1])
+    save_img_ind = np.random.randint(data['valid_data'].shape[1])
     if debug:
-        utils.save_image('debug_output/valid_image.jpg', valid_data[0, save_img_ind, :, :, 0])
+        utils.save_image('debug_output/valid_image.jpg', data['valid_data'][0, save_img_ind])
 
-    # get filename
-    net_filename = os.path.join(save_path, dataset['name'] + "_" + str(seed) + "_best_model.ckpt")
+    # produce saving directory filenames
+    folder_name = dataset['name'] + "_" + dataset['train_set'] + "_" + time.strftime(
+        "%d_%m_%Y_%H:%M:%S") + "_" + str(seed)
+    net_folder_path = os.path.join(save_path, folder_name)
+    utils.create_directory(net_folder_path)
+
+    model_config_path = os.path.join(net_folder_path, "model_config.pickle")
+    em_dump_path = None
+
+    if em['suffix'] is not None:
+        em_dump_path = 'results/{}_{}_{}{}.pickle'.format(dataset['name'], em['nr_iters'], em['k'], em['suffix'])
+
+    # save net structure
+    with open(model_config_path, 'wb') as f:
+        pickle.dump({'network': network, 'em': em, 'dataset': dataset}, f)
 
     # train dea
-    data = {'train_data': train_data, 'valid_data': valid_data}
-    train_dae(data=data, net_filename=net_filename, **{'save_img_ind': save_img_ind})
+    train_dae(data=data, net_folder_path=net_folder_path, **{'save_img_ind': save_img_ind})
 
     # load test data
-    test_data, test_groups = get_test_data()
+    data = get_test_data()
+    test_data = data['test_data']
+    test_groups = data['test_groups'] if 'test_groups' in data.keys() else None
 
-    # create new session
-    with tf.Graph().as_default(), tf.Session() as session:
-        with tf.variable_scope("model"):
-            batch_size = 1
-            b_training = training.copy()
-            b_training['batch_size'] = batch_size
-            m = DAEModel(is_training=True, training=b_training)
-
-        # restore params
-        saver = tf.train.Saver()
-        saver.restore(session, net_filename)
-
-        # run reconstruction clustering for dea
-        return evaluate(session=session, model=m, test_data=test_data, test_groups=test_groups)
+    # perform rc on best model
+    return perform_reconstruction_clustering_from_file(net_folder_path, test_data, test_groups, _rnd, em_dump_path=em_dump_path)
