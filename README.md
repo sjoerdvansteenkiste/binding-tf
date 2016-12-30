@@ -1,6 +1,5 @@
-# Perceptual grouping in TensorFlow
-An implementation of the perceptual grouping framework as described in ["Binding by Reconstruction Clustering"](http://arxiv.org/abs/1511.06418) implemented in TensorFlow. 
-Datasets and evaluation scripts can be found [here](https://github.com/Qwlouse/Binding) 
+# Binding by Reconstruction Clustering in TensorFlow
+A TensorFlow implementation of the perceptual grouping framework as described in ["Binding by Reconstruction Clustering"](http://arxiv.org/abs/1511.06418). Additional resources for can be found [here](https://github.com/Qwlouse/Binding) 
 
 ## Dependencies and Setup
 
